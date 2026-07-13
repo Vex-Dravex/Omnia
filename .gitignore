@@ -1,0 +1,18 @@
+# Rust
+guest-agent/target/
+
+# Swift Package Manager
+vmd/.build/
+vmd/.swiftpm/
+cli/.build/
+cli/.swiftpm/
+
+# Generated proto (regenerate via scripts/generate-swift-proto.sh)
+cli/Sources/omnia/Generated/*.swift
+
+# Linux image build scratch space
+tools/build-linux-image/.work/
+tools/build-linux-image/.output/
+
+# macOS
+.DS_Store

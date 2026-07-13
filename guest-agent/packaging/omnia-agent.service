@@ -1,0 +1,21 @@
+[Unit]
+Description=Omnia guest control agent
+After=network.target
+# Weston (docs/02-linux-runtime.md) isn't part of M1's scope yet; once M2
+# adds it, this unit should gain `After=weston.service` so WatchEvents has
+# something real to report on window-count changes.
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/omnia-agent --vsock-port 5151
+Restart=always
+RestartSec=1
+# The agent has no need for elevated privileges beyond mounting block devices
+# for the Finder-drive-integration feature (M5) — CAP_SYS_ADMIN is scoped
+# narrowly rather than running the whole daemon as root once that lands.
+# For M1 (no mount calls exercised outside tests), User=root is a placeholder
+# to be tightened when M5 defines the real capability set.
+User=root
+
+[Install]
+WantedBy=multi-user.target
