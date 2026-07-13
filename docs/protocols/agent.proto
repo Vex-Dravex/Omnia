@@ -1,0 +1,201 @@
+syntax = "proto3";
+
+package omnia.agent.v1;
+
+// Transport: this service is exposed by `omnia-agent` (running inside each guest)
+// over a vsock stream, one gRPC connection per guest, established by `vmd`
+// immediately after a guest reaches the `running` state (see docs/06-lifecycle-memory.md).
+// The host (vmd) is always the gRPC client; the guest agent is always the server.
+//
+// This file is the authoritative interface between host and guest code. Any change
+// here requires updating both the Swift host client (vmd) and the Rust guest agent
+// (omnia-agent) in the same milestone.
+
+service OmniaAgent {
+  // Liveness / capability handshake, called once per connection.
+  rpc Hello(HelloRequest) returns (HelloResponse);
+
+  // App inventory for the export picker (docs/05-app-integration.md) and
+  // marketplace "already installed" checks (docs/09-marketplace.md).
+  rpc ListApps(ListAppsRequest) returns (ListAppsResponse);
+
+  // Launch an app's process inside the guest so a RAIL session (docs/04) can
+  // attach to it. Returns once the process has been started, not once it has
+  // finished rendering a window (RAIL/window-create events arrive via the
+  // WatchEvents stream below).
+  rpc LaunchApp(LaunchAppRequest) returns (LaunchAppResponse);
+
+  rpc TerminateApp(TerminateAppRequest) returns (TerminateAppResponse);
+
+  // Marketplace install/uninstall (docs/09-marketplace.md). Streams progress
+  // so the host UI can show a progress bar; final message carries success/error.
+  rpc InstallApp(InstallAppRequest) returns (stream InstallProgress);
+  rpc UninstallApp(UninstallAppRequest) returns (UninstallAppResponse);
+
+  // Interactive or one-shot shell (docs/08-cli.md). Bidirectional stream:
+  // client sends stdin chunks + resize events, server streams stdout/stderr
+  // chunks and a final exit-code message.
+  rpc OpenShell(stream ShellInput) returns (stream ShellOutput);
+
+  // Block device mount/unmount for external-drive passthrough (docs/07-filesystem.md).
+  rpc MountBlockDevice(MountBlockDeviceRequest) returns (MountBlockDeviceResponse);
+  rpc UnmountBlockDevice(UnmountBlockDeviceRequest) returns (UnmountBlockDeviceResponse);
+
+  // Single long-lived stream the guest uses to push events to the host:
+  // window-count transitions (drives auto-suspend, docs/06), memory pressure
+  // hints (drives the balloon controller, docs/06), and install progress
+  // fan-out is intentionally NOT here — that's InstallApp's own stream.
+  rpc WatchEvents(WatchEventsRequest) returns (stream AgentEvent);
+}
+
+message HelloRequest {
+  string host_protocol_version = 1; // semver of this .proto as understood by vmd
+}
+
+message HelloResponse {
+  string agent_version = 1;
+  GuestOS guest_os = 2;
+  bool ready = 3; // false if the agent is up but the guest is still finishing boot-time init
+}
+
+enum GuestOS {
+  GUEST_OS_UNSPECIFIED = 0;
+  GUEST_OS_LINUX = 1;
+  GUEST_OS_WINDOWS = 2;
+}
+
+message ListAppsRequest {}
+
+message AppInfo {
+  string app_id = 1;             // Flatpak app id, or a stable hash of the Windows shortcut target
+  string display_name = 2;
+  bytes icon_png = 3;            // pre-rendered PNG, host converts to .icns at export time (docs/05)
+  string remote_application_program = 4; // exe path (Windows) or Weston app id (Linux) — fed into
+                                          // the RAIL RemoteApplicationProgram field, docs/04
+  string source_package_id = 5;  // empty if not installed via the marketplace catalog
+}
+
+message ListAppsResponse {
+  repeated AppInfo apps = 1;
+}
+
+message LaunchAppRequest {
+  string app_id = 1;
+  repeated string args = 2;
+}
+
+message LaunchAppResponse {
+  bool started = 1;
+  string error = 2; // empty on success
+}
+
+message TerminateAppRequest {
+  string app_id = 1;
+}
+
+message TerminateAppResponse {
+  bool terminated = 1;
+}
+
+message InstallAppRequest {
+  string source_catalog = 1;   // "flathub" | "winget" — see docs/09-marketplace.md
+  string source_package_id = 2;
+}
+
+message InstallProgress {
+  enum Stage {
+    STAGE_UNSPECIFIED = 0;
+    STAGE_DOWNLOADING = 1;
+    STAGE_INSTALLING = 2;
+    STAGE_DONE = 3;
+    STAGE_ERROR = 4;
+  }
+  Stage stage = 1;
+  float fraction_complete = 2; // 0.0–1.0, best-effort; -1 if the underlying tool doesn't report it
+  string message = 3;
+  AppInfo installed_app = 4; // set only on the final STAGE_DONE message
+}
+
+message UninstallAppRequest {
+  string app_id = 1;
+}
+
+message UninstallAppResponse {
+  bool uninstalled = 1;
+}
+
+message ShellInput {
+  oneof payload {
+    ShellOpen open = 1;      // first message on the stream
+    bytes stdin_chunk = 2;
+    TerminalResize resize = 3;
+  }
+}
+
+message ShellOpen {
+  GuestOS target_shell = 1;      // which shell binary to spawn, resolved guest-side
+                                  // (bash/zsh on Linux, pwsh/cmd on Windows — see docs/08-cli.md)
+  repeated string command = 2;   // empty = interactive shell; non-empty = one-shot command
+  uint32 initial_cols = 3;
+  uint32 initial_rows = 4;
+}
+
+message TerminalResize {
+  uint32 cols = 1;
+  uint32 rows = 2;
+}
+
+message ShellOutput {
+  oneof payload {
+    bytes stdout_chunk = 1;
+    bytes stderr_chunk = 2;
+    int32 exit_code = 3; // final message on the stream
+  }
+}
+
+message MountBlockDeviceRequest {
+  string device_path = 1; // e.g. /dev/vdb inside the guest, assigned by vmd when it
+                           // attaches the passthrough device (docs/07-filesystem.md)
+  string requested_mount_point = 2; // advisory; agent returns the actual path used
+}
+
+message MountBlockDeviceResponse {
+  bool mounted = 1;
+  string mount_point = 2;
+  string filesystem_type = 3; // "ext4" | "btrfs" | "ntfs" | ...
+  string error = 4;
+}
+
+message UnmountBlockDeviceRequest {
+  string mount_point = 1;
+}
+
+message UnmountBlockDeviceResponse {
+  bool unmounted = 1;
+}
+
+message WatchEventsRequest {}
+
+message AgentEvent {
+  oneof event {
+    WindowCountChanged window_count_changed = 1;
+    MemoryPressure memory_pressure = 2;
+  }
+}
+
+// Primary auto-suspend trigger — see docs/06-lifecycle-memory.md.
+message WindowCountChanged {
+  uint32 visible_app_windows = 1; // count across all RAIL sessions + desktop-mode session
+}
+
+// Drives the balloon controller's inflate/deflate decisions — see docs/06-lifecycle-memory.md.
+message MemoryPressure {
+  enum Level {
+    LEVEL_UNSPECIFIED = 0;
+    LEVEL_NORMAL = 1;
+    LEVEL_WARNING = 2;
+    LEVEL_CRITICAL = 3;
+  }
+  Level level = 1;
+  uint64 free_bytes = 2;
+}
