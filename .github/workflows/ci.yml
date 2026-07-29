@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  guest-agent:
+    name: guest-agent (Rust, Linux)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: guest-agent
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: guest-agent
+      - name: Format check
+        run: cargo fmt -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --all-targets
+
+  vmd:
+    name: vmd (Swift, macOS)
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: vmd
+    steps:
+      - uses: actions/checkout@v4
+      - name: Swift version
+        run: swift --version
+      - name: Build
+        run: swift build
+      - name: Test (OmniaVMDCore state machine)
+        run: swift test
+
+  cli:
+    name: cli (Swift, macOS)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Swift version
+        run: swift --version
+      - name: Install proto toolchain
+        run: brew install protobuf swift-protobuf grpc-swift
+      - name: Generate Swift proto stubs
+        run: ./scripts/generate-swift-proto.sh
+      - name: Build
+        working-directory: cli
+        run: swift build
