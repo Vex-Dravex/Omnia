@@ -16,6 +16,12 @@ final class VMDXPCDelegate: NSObject, NSXPCListenerDelegate {
     }
 }
 
+// The vsock<->UDS relay writes into sockets that peers can reset at any
+// moment (a gRPC client aborting, a guest going away). Without this, the
+// resulting SIGPIPE kills the whole daemon — which in dev testing showed
+// up as vmd silently vanishing mid-session.
+signal(SIGPIPE, SIG_IGN)
+
 let delegate = VMDXPCDelegate()
 let listener = NSXPCListener(machServiceName: VMDXPCServiceName.value)
 listener.delegate = delegate

@@ -15,14 +15,50 @@ import Virtualization
 /// this — see BUILDING.md). Treat the `pump` function as the first thing to
 /// stress-test once this builds on a real Mac against a real guest.
 final class VsockControlProxy {
-    private let vsockDevice: VZVirtioSocketDevice
+    /// Opens a vsock connection to the guest on the given port. Injected by
+    /// the runtime (see LinuxRuntime.connectControlChannel) so the hop onto
+    /// the VM's queue — required for VZ device calls — happens there, not
+    /// here.
+    typealias VsockConnector = @Sendable (
+        _ port: UInt32,
+        _ completion: @escaping @Sendable (Result<VZVirtioSocketConnection, any Error>) -> Void
+    ) -> Void
+
+    private let connectVsock: VsockConnector
     private let port: UInt32
     private let socketPath: String
     private var listenerFD: Int32 = -1
     private var acceptSource: DispatchSourceRead?
 
-    init(vsockDevice: VZVirtioSocketDevice, port: UInt32, socketPath: String) {
-        self.vsockDevice = vsockDevice
+    /// Session-activity callbacks, driving M1's idle-suspend policy
+    /// (milestones/M1 task #8): every relayed connection counts as an
+    /// active session; `onAllSessionsClosed` fires when the count returns
+    /// to zero (start the idle countdown), `onSessionActive` on 0 -> 1
+    /// (cancel it).
+    var onSessionActive: (@Sendable () -> Void)?
+    var onAllSessionsClosed: (@Sendable () -> Void)?
+
+    private let sessionLock = NSLock()
+    private var activeSessions = 0
+
+    private func sessionOpened() {
+        sessionLock.lock()
+        activeSessions += 1
+        let becameActive = activeSessions == 1
+        sessionLock.unlock()
+        if becameActive { onSessionActive?() }
+    }
+
+    private func sessionClosed() {
+        sessionLock.lock()
+        activeSessions -= 1
+        let becameIdle = activeSessions == 0
+        sessionLock.unlock()
+        if becameIdle { onAllSessionsClosed?() }
+    }
+
+    init(port: UInt32, socketPath: String, connectVsock: @escaping VsockConnector) {
+        self.connectVsock = connectVsock
         self.port = port
         self.socketPath = socketPath
     }
@@ -81,25 +117,54 @@ final class VsockControlProxy {
         let clientFD = accept(listenerFD, nil, nil)
         guard clientFD >= 0 else { return }
 
-        vsockDevice.connect(toPort: port) { result in
+        connectVsock(port) { result in
             switch result {
             case .success(let connection):
-                let vsockFD = connection.fileDescriptor
-                Self.pump(from: clientFD, to: vsockFD)
-                Self.pump(from: vsockFD, to: clientFD)
+                // Take ownership via dup: VZVirtioSocketConnection closes
+                // its fd when it goes away, and nothing retains it beyond
+                // this closure — a relay running on the connection's own fd
+                // would be cut off at an arbitrary point.
+                let vsockFD = dup(connection.fileDescriptor)
+                connection.close()
+                guard vsockFD >= 0 else {
+                    close(clientFD)
+                    return
+                }
+                self.sessionOpened()
+                Self.relay(clientFD, vsockFD) { [weak self] in
+                    self?.sessionClosed()
+                }
             case .failure:
                 close(clientFD)
             }
         }
     }
 
+    /// Full-duplex relay for one accepted connection: one pump per
+    /// direction. A direction hitting EOF half-closes (shutdown SHUT_WR)
+    /// the other side so stream teardown propagates like a real socket
+    /// pair; the fds are closed exactly once, after BOTH directions finish
+    /// — closing them per-pump would double-close and kill the opposite
+    /// direction mid-stream.
+    private static func relay(_ a: Int32, _ b: Int32, onFinish: @escaping @Sendable () -> Void) {
+        let group = DispatchGroup()
+        pump(from: a, to: b, group: group)
+        pump(from: b, to: a, group: group)
+        group.notify(queue: .global(qos: .utility)) {
+            close(a)
+            close(b)
+            onFinish()
+        }
+    }
+
     /// One-directional byte pump. Two of these (in opposite directions) make
     /// up a full-duplex relay for one accepted connection.
-    private static func pump(from source: Int32, to destination: Int32) {
+    private static func pump(from source: Int32, to destination: Int32, group: DispatchGroup) {
         let queue = DispatchQueue(label: "com.omnia.vmd.vsockproxy.pump")
+        group.enter()
         queue.async {
             var buffer = [UInt8](repeating: 0, count: 16 * 1024)
-            while true {
+            outer: while true {
                 let n = buffer.withUnsafeMutableBytes { ptr in
                     read(source, ptr.baseAddress, ptr.count)
                 }
@@ -109,12 +174,12 @@ final class VsockControlProxy {
                     let w = buffer.withUnsafeBytes { ptr in
                         write(destination, ptr.baseAddress!.advanced(by: written), n - written)
                     }
-                    if w <= 0 { break }
+                    if w <= 0 { break outer }
                     written += w
                 }
             }
-            close(source)
-            close(destination)
+            shutdown(destination, SHUT_WR)
+            group.leave()
         }
     }
 }

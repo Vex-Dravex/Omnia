@@ -31,6 +31,11 @@ final class VMDService: NSObject, VMDXPCProtocol {
             auxiliaryStoragePath: supportDirectory.appendingPathComponent("linux/aux")
         )
         let controller = GuestLifecycleController(kind: .linux, runtime: linuxRuntime)
+        // Guest poweroff/crash/VZ failure -> reset the state machine so the
+        // next ensureRunning() cold-boots instead of serving a dead guest.
+        linuxRuntime.onUnexpectedStop = {
+            Task { await controller.noteGuestStopped() }
+        }
         guests[.linux] = GuestEntry(controller: controller, runtime: linuxRuntime, proxy: nil)
 
         // .windows added in M3 (milestones/M3-windows-runtime.md) once
@@ -66,14 +71,31 @@ final class VMDService: NSObject, VMDXPCProtocol {
                 return
             }
 
-            let socketPath = supportDirectory.appendingPathComponent("sockets/\(guest)-control.sock").path
+            let socketsDirectory = supportDirectory.appendingPathComponent("sockets", isDirectory: true)
+            try? FileManager.default.createDirectory(at: socketsDirectory, withIntermediateDirectories: true)
+            let socketPath = socketsDirectory.appendingPathComponent("\(guest)-control.sock").path
 
             if entry.proxy == nil {
-                guard let vsockDevice = entry.runtime.currentVsockDevice() else {
+                guard entry.runtime.hasVsockDevice() else {
                     reply(nil, "guest \(guest) has no vsock device available")
                     return
                 }
-                let proxy = VsockControlProxy(vsockDevice: vsockDevice, port: 5151, socketPath: socketPath)
+                let runtime = entry.runtime
+                let proxy = VsockControlProxy(port: LinuxRuntime.controlPort, socketPath: socketPath) { port, completion in
+                    runtime.connectControlChannel(port: port, completion: completion)
+                }
+                // M1 idle-suspend policy (milestone task #8): a closed shell
+                // session starts the 90s countdown, a new one cancels it.
+                // onLastWindowClosed is window-centric naming from docs/06;
+                // until RAIL exists (M2), "no active control sessions" is
+                // the equivalent signal.
+                let controller = entry.controller
+                proxy.onSessionActive = {
+                    Task { await controller.onActivity() }
+                }
+                proxy.onAllSessionsClosed = {
+                    Task { await controller.onLastWindowClosed() }
+                }
                 do {
                     try proxy.start()
                     entry.proxy = proxy

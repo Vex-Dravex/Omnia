@@ -14,7 +14,10 @@ final class VMDClient {
     init() {
         connection = NSXPCConnection(machServiceName: VMDXPCServiceName.value, options: [])
         connection.remoteObjectInterface = NSXPCInterface(with: VMDXPCProtocol.self)
-        connection.invalidationHandler = {
+        // interruption = vmd went away mid-conversation (crash/kill) —
+        // worth telling the user about. Plain invalidation also fires on
+        // our own deinit's invalidate(), so it must stay silent.
+        connection.interruptionHandler = {
             FileHandle.standardError.write(
                 Data("omnia: lost connection to vmd — is Omnia.app running?\n".utf8))
         }

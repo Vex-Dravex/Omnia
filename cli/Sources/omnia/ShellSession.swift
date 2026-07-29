@@ -26,10 +26,20 @@ enum ShellSession {
             if isInteractive { restoreTerminalMode() }
         }
 
+        // :authority override: for UDS targets the transport otherwise
+        // derives the authority from the socket PATH, whose slashes (and,
+        // here, spaces — ~/Library/Application Support/…) make it an
+        // invalid URI authority. tonic's h2 rejects that with a
+        // protocol-error RST_STREAM. "localhost" matches what go-grpc
+        // sends for unix targets.
+        var config = HTTP2ClientTransport.Posix.Config.defaults
+        config.http2.authority = "localhost"
+
         return try await withGRPCClient(
             transport: .http2NIOPosix(
                 target: .unixDomainSocket(path: socketPath),
-                transportSecurity: .plaintext
+                transportSecurity: .plaintext,
+                config: config
             )
         ) { client in
             let agent = Omnia_Agent_V1_OmniaAgent.Client(wrapping: client)

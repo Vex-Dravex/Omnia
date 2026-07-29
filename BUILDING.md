@@ -1,143 +1,149 @@
 # Building Omnia — current status
 
-This documents what has and hasn't actually been compiled/run, as of the M1
-handoff. Read this before assuming any given file works.
+**M1 (milestones/M1-linux-runtime.md) is verified end to end on a real
+Mac** (Apple Silicon, macOS 26, Xcode 26.2, 2026-07-29):
+`tests/m1_linux_runtime.sh` passes all nine checks — cold boot via
+`omnia linux echo hi`, real guest exit-code propagation, idle-suspend to
+zero VM footprint ~90s after the last session closes, resume-from-snapshot
+answering `uname -a` in ~2s wall clock, and a marker file with identical
+mtime+content across suspend/resume proving true resume, not a reboot.
 
-## Environment this was written in
+This file is the honest ledger of what's proven vs. written-but-unproven.
+Update it whenever something moves from one column to the other.
 
-Linux container, no Xcode, no macOS SDK, no Swift toolchain at all. Rust/Cargo
-was available. This shapes everything below: **the Rust guest-agent is real,
-built, and tested. The Swift code (vmd, cli) is a careful first draft that
-has never been compiled.**
+## Component status
 
-## `guest-agent/` — Rust, verified (Linux x86_64 and macOS arm64)
+### `guest-agent/` — Rust, verified
 
 ```
 cd guest-agent
-cargo build          # clean
-cargo test            # 10/10 passing, including a real client/server
-                       # round trip over a Unix socket (see
-                       # tests/integration_unix_socket.rs) that spawns an
-                       # actual PTY process and propagates its real exit code
-cargo clippy --all-targets -- -D warnings   # clean
+cargo test                                   # 10/10 (Linux x86_64 AND macOS arm64)
+cargo clippy --all-targets -- -D warnings    # clean
 cargo fmt -- --check                         # clean
+cargo build --release --target aarch64-unknown-linux-musl   # static ELF, ~6MB
 ```
 
-Re-verified on macOS 15 / Apple Silicon (rustc 1.97.1): all of the above
-pass there too. One platform fix was needed: `src/mount.rs` used the
-Linux-shaped `nix::mount` API, which doesn't exist on macOS — the real
-mount/umount impls are now gated `#[cfg(target_os = "linux")]`, with
-non-Linux hosts (dev-mode) returning a clear "only in the Linux guest"
-error. No tests needed gating; all 10 pass unmodified on macOS.
+The cross-compile needs no external toolchain: `.cargo/config.toml` sets
+`rust-lld` as the linker for the musl target. `src/mount.rs`'s real
+mount/umount are `#[cfg(target_os = "linux")]` (nix's mount API is
+Linux-shaped; non-Linux dev-mode returns a clear unsupported error).
 
-What's real: `Hello`, `OpenShell` (interactive + one-shot commands, real PTY,
-real exit codes), `MountBlockDevice`/`UnmountBlockDevice` (real `mount(2)`
-syscalls via `nix`, unit-tested through an injectable `BlockDeviceOps` trait
-so the RPC-handling logic doesn't need root/real block devices in CI),
-`WatchEvents` (M1-scope stub — never yields, by design; M2/M4 make it real).
-`ListApps`/`LaunchApp`/`TerminateApp`/`InstallApp`/`UninstallApp` return
-`Status::unimplemented` — they're out of scope until M2/M6.
+Verified against a real guest over real vsock: `Hello` and `OpenShell`
+(one-shot commands, exit codes) — the full M1 path. Not yet exercised for
+real: `MountBlockDevice`/`UnmountBlockDevice` against an actual attached
+disk (unit-tested through the `BlockDeviceOps` seam only), and
+`WatchEvents` is an intentional never-yielding stub until M2/M4.
 
-Production transport is vsock (`src/main.rs`, gated `#[cfg(target_os =
-"linux")]`, using `tokio-vsock`) — this compiles but has not been exercised
-against a real VM guest, since this sandbox has no vsock device. Everything
-above was tested via the `--unix-socket` dev-mode flag instead. **The first
-thing to verify on real guest hardware/VM is that the vsock path behaves the
-same way the UDS path was proven to.**
+### `vmd/` — Swift, verified against a real booted guest
 
-Cross-compilation to the production target `aarch64-unknown-linux-musl`
-is verified from macOS: `rustup target add aarch64-unknown-linux-musl`,
-then `cargo build --release --target aarch64-unknown-linux-musl`
-produces a statically linked aarch64 ELF (~6 MB). No external musl-cross
-toolchain is needed — `guest-agent/.cargo/config.toml` sets `rust-lld`
-(shipped with rustup) as the linker for that target, using rust-std's
-self-contained musl CRT/libc objects.
+`swift build` + `swift test` (7/7 lifecycle tests) clean. Runtime-proven:
+cold boot, suspend-to-snapshot, restore, vsock→UDS control-channel proxy.
+Hard-won fixes the drafts needed, so nobody re-learns them:
 
-## `vmd/` — Swift, verified (build + tests on macOS 26 / Xcode 26.2)
+- Snapshot restore fails with VZErrorDomain code 12 ("invalid argument")
+  unless the restore-time configuration matches the saved one **including
+  identity that VZ randomizes per-config**: the
+  `VZGenericMachineIdentifier` AND the network device's MAC address. Both
+  are persisted next to the image (`machine-id`, `mac-address`) on first
+  boot.
+- `saveMachineStateTo` requires the VM to be paused first.
+- `VZVirtualMachine` is queue-bound: every VM/device call happens on the
+  serial queue the VM was created with (see LinuxRuntime).
+- A bare `VZVirtioConsoleDeviceConfiguration` fails validation; the
+  guest's `console=hvc0` is a `VZVirtioConsoleDeviceSerialPortConfiguration`
+  with a file attachment — the guest boot log lands in
+  `~/Library/Application Support/Omnia/linux/console.log`.
+- vmd ignores SIGPIPE (main.swift) — relay writes to reset sockets
+  otherwise kill the daemon silently.
+- "Running" means "the agent answers on vsock" (LinuxRuntime probes port
+  5151 after start/restore), not "vCPUs are executing" — without that,
+  every caller races the guest boot.
+- Guest-initiated stops and VZ runtime failures reset the state machine
+  via `VZVirtualMachineDelegate` → `GuestLifecycleController.noteGuestStopped`.
 
-`swift build` and `swift test` both pass (7/7
-`GuestLifecycleControllerTests`). Fixes the first real compile needed:
-the snapshot APIs' real Swift names are `saveMachineStateTo(url:)` /
-`restoreMachineStateFrom(url:)`; `VZVirtualMachine` calls and the mutable
-VM reference are now confined to the runtime's serial queue (the VM is
-created with the queue-binding initializer); and `suspend()` pauses
-before saving state, which the framework requires. Still unproven at
-runtime: nothing here has booted a real guest yet — that's the M1
-acceptance flow's job. Original pre-compile status notes below.
+Still unproven: suspend/resume under real memory pressure, the proxy
+under concurrent load, WatchEvents-driven suspend policy (M2/M4).
 
-### Pre-compile notes (historical)
+### `cli/` — Swift, verified against a real guest
 
-Depends on `Virtualization.framework` and XPC (`NSXPCConnection`,
-`NSXPCListener`), both macOS-only and unavailable to compile-check here.
+Uses **gRPC Swift 2** (GRPCCore + grpc-swift-nio-transport +
+grpc-swift-protobuf; the brew `grpc-swift` formula's plugin binary is
+`protoc-gen-grpc-swift-2`). Consequence: the cli package's platform floor
+is **macOS 15** (gRPC Swift 2's minimum; vmd itself remains macOS 14, and
+every Apple Silicon Mac can run 15). gRPC Swift 1.x is maintenance-only
+and its protoc plugin no longer ships as a brew bottle — don't go back.
 
-- `Sources/OmniaVMDCore/GuestState.swift` — the lifecycle state machine
-  (docs/06-lifecycle-memory.md). Deliberately has zero Apple-only imports.
-  This is the one part of `vmd` that could plausibly build with a
-  Linux Swift toolchain if you have one handy for a quick sanity check
-  before moving to Xcode — worth trying first since it'll surface basic
-  syntax mistakes faster than a full Xcode build.
-- `Tests/OmniaVMDCoreTests/GuestLifecycleControllerTests.swift` — written
-  against that state machine, has never been run. Run `swift test` on a Mac
-  as literally the first verification step for this repo's Swift code.
-- `Sources/vmd/LinuxRuntime.swift` — `VZVirtualMachine` wrapper. The
-  `VZLinuxBootLoader` vs `VZEFIBootLoader` choice is flagged as an open TODO
-  matching M1 task #3's note; everything else follows docs/02's config table
-  but needs real `swift build` iteration against actual Virtualization.framework
-  API signatures, which may have shifted across SDK versions.
-- `Sources/vmd/VsockControlProxy.swift` — bridges a guest's vsock control
-  channel to a local Unix socket for the CLI to connect to. Explicitly
-  flagged in its own header as a first draft: the byte-relay loop's
-  shape is right, its behavior under real load/errors is not proven.
-- `Sources/vmd/VMDService.swift`, `VMDXPCProtocol.swift`, `main.swift` — the
-  XPC service wiring. Ordinary `NSXPCConnection`/`NSXPCListener` usage,
-  lower risk than the two files above, but still unbuilt.
+Notable: for UDS targets the NIO transport derives HTTP/2 `:authority`
+from the socket path, which tonic's h2 rejects (slashes/spaces make an
+invalid URI authority) with a protocol-error RST_STREAM —
+ShellSession.swift overrides the authority to "localhost".
 
-## `cli/` — Swift, verified (build on macOS 26 / Xcode 26.2), migrated to gRPC Swift 2
+Generated stubs are intentionally not committed — run
+`scripts/generate-swift-proto.sh` after cloning and after any
+`docs/protocols/agent.proto` change (Rust stubs regenerate automatically
+via `guest-agent/build.rs`; regenerate both sides in the same commit).
 
-`scripts/generate-swift-proto.sh` + `swift build` pass; `omnia --help`
-runs. The predicted rework of `ShellSession.swift` was real, and bigger
-than typo fixes: the draft targeted grpc-swift **1.x**, whose protoc
-plugin no longer ships as a brew bottle and which is maintenance-only.
-The cli package now uses **gRPC Swift 2** (GRPCCore +
-grpc-swift-nio-transport + grpc-swift-protobuf; plugin binary
-`protoc-gen-grpc-swift-2`), and `ShellSession.swift` was rewritten
-against the real generated v2 API (`withGRPCClient`,
-`Omnia_Agent_V1_OmniaAgent.Client`, writer-producer streaming). Cost:
-gRPC Swift 2 requires **macOS 15+**, so cli/Package.swift's platform
-floor is 15 (vmd remains 14; every Apple Silicon Mac can run 15).
-Also fixed: `@main` cannot live in `main.swift` (now `Omnia.swift`),
-and the generated enum is `Omnia_Agent_V1_GuestOS`, not `...GuestOs`.
-Unproven at runtime: an actual OpenShell round trip against the agent —
-that's the M1 acceptance flow. Original pre-compile status notes below.
+One-shot `omnia linux <cmd>` output arrives CRLF because the agent always
+allocates a PTY. A no-PTY mode for non-interactive commands (ssh-like)
+is a nice-to-have for M2+.
 
-### Pre-compile notes (historical)
+## Building the Linux guest image (from macOS)
 
-- `Sources/omnia/main.swift`, `VMDClient.swift` — ArgumentParser commands and
-  the XPC client talking to vmd. Ordinary Foundation code, lowest risk in
-  this package.
-- `Sources/omnia/ShellSession.swift` — **the highest-risk file in this whole
-  handoff.** It drives `OpenShell` via grpc-swift's async client API,
-  written from memory without being able to run `protoc-gen-grpc-swift` and
-  check the real generated symbol names/signatures against grpc-swift's
-  actual current API. Its own header comment says this explicitly. Do not
-  trust it beyond "this is the intended shape" until you've run
-  `scripts/generate-swift-proto.sh` and reconciled this file against
-  whatever actually gets generated.
+```
+cd guest-agent && cargo build --release --target aarch64-unknown-linux-musl
+./tools/build-linux-image/build-in-vm.sh
+```
 
-## What to do next, in order
+`build-in-vm.sh` boots a throwaway aarch64 Ubuntu cloud VM under
+qemu+HVF (`brew install qemu`), runs `build-rootfs-inner.sh` inside it
+(Arch Linux ARM base tarball + omnia-agent + systemd unit + vsock
+module-load, packed with `mkfs.ext4 -d` — no loop devices, no partition
+table: LinuxRuntime boots `root=/dev/vda`, the disk IS the filesystem),
+and drops `rootfs.img` / `vmlinuz` (uncompressed arm64 Image for
+`VZLinuxBootLoader`) / `initramfs.img` (mkinitcpio, autodetect skipped)
+into `tools/build-linux-image/.output/`. The original `build.sh` remains
+the native-Arch-infra path; it predates the whole-disk layout and needs
+the same partition-table correction before anyone uses it.
 
-1. `cd guest-agent && cargo test` — confirm the baseline still holds on
-   whatever machine you're on.
-2. On a Mac: `swift build` in `vmd/`, starting with `OmniaVMDCore` (no Apple
-   frameworks) before `vmd` itself (Virtualization.framework/XPC). Fix
-   compile errors — there will be some.
-3. `swift test` in `vmd/` — validate `GuestLifecycleControllerTests` against
-   the real Swift Testing/XCTest toolchain.
-4. Boot the built Linux image (once `tools/build-linux-image/build.sh` has
-   been run on real ARM build infra) under a scratch `VZVirtualMachine` and
-   confirm `omnia-agent` answers `Hello` over real vsock — this is the one
-   guest-agent behavior this sandbox couldn't prove.
-5. `scripts/generate-swift-proto.sh`, then `swift build` in `cli/`, then
-   reconcile `ShellSession.swift` against the real generated API.
-6. Only then attempt the full milestones/M1-linux-runtime.md acceptance
-   criteria end to end.
+## Local dev setup (vmd + CLI against a real guest)
+
+1. Install the image artifacts:
+   `mkdir -p ~/Library/Application\ Support/Omnia/linux && cp tools/build-linux-image/.output/{rootfs.img,vmlinuz,initramfs.img} ~/Library/Application\ Support/Omnia/linux/`
+2. Build and sign vmd (Virtualization.framework needs the entitlement,
+   ad-hoc signing is fine locally):
+   `cd vmd && swift build && codesign --force --sign - --entitlements vmd.entitlements .build/debug/vmd`
+3. Register vmd as a per-user LaunchAgent named `com.omnia.vmd`
+   (`NSXPCListener(machServiceName:)` requires launchd): a plist with
+   `MachServices = {com.omnia.vmd: true}` and `ProgramArguments` pointing
+   at `.build/debug/vmd`, then
+   `launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.omnia.vmd.plist`.
+   After every rebuild: re-sign, then
+   `launchctl kickstart -k gui/$UID/com.omnia.vmd`.
+4. Build the CLI: `scripts/generate-swift-proto.sh && cd cli && swift build`.
+5. Run the acceptance suite: `tests/m1_linux_runtime.sh` (~3 minutes,
+   treats the guest as disposable).
+
+If the image or VM configuration changes shape, delete
+`~/Library/Application Support/Omnia/linux/snapshot.vzstate` — a stale
+snapshot can't restore into a changed config (and `machine-id` /
+`mac-address` in that directory must survive for snapshots to work).
+
+## CI
+
+`.github/workflows/ci.yml`: Rust job on ubuntu-latest (fmt, clippy,
+tests), Swift jobs on macos-26 (grpc-swift-nio-transport needs a newer
+SDK than macos-15's default Xcode, and the proto plugin bottle needs a
+recent image). The cli job regenerates proto stubs before building. CI
+proves compilation + unit tests only — the M1 acceptance flow needs a
+real Apple Silicon host with Virtualization and stays local for now.
+
+## Known gaps / where M2 picks up
+
+- RAIL/Weston presentation (M2) — weston/xwayland aren't in the M1 image
+  (build-rootfs-inner.sh installs nothing beyond the ALARM base).
+- `WatchEvents` is a never-yielding stub; idle-suspend currently keys off
+  "no active control-socket sessions" (VsockControlProxy session count).
+- Interactive `omnia shell`/`omnia linux` (raw-mode TTY) is wired but has
+  only been exercised non-interactively.
+- Root password in the image is a dev placeholder (`omnia`); the
+  agent-mediated path is the only supported entry point.

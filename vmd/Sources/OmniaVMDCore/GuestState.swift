@@ -99,6 +99,16 @@ public actor GuestLifecycleController {
         cancelIdleTimer()
     }
 
+    /// Called by the runtime when the underlying VM stops outside the state
+    /// machine's control (guest poweroff/crash, VZ runtime error). Resets to
+    /// `.stopped` so the next `ensureRunning()` cold-boots instead of
+    /// handing callers a dead guest, and fails any queued waiters.
+    public func noteGuestStopped() {
+        cancelIdleTimer()
+        state = .stopped
+        resolveRunningWaiters(.failure(GuestLifecycleError.runtimeFailure("guest stopped unexpectedly")))
+    }
+
     /// Power-user override (`omnia suspend`, docs/08-cli.md) — bypasses the
     /// idle timer and suspends immediately.
     public func forceSuspend() async throws {
