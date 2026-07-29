@@ -90,6 +90,6 @@ func runShell(guest: GuestKind, command: [String]) async throws -> Int32 {
     let client = VMDClient()
     try await client.ensureRunning(guest: guest)
     let socketPath = try await client.controlSocketPath(guest: guest)
-    let protoGuestOS: Omnia_Agent_V1_GuestOs = (guest == .linux) ? .linux : .windows
+    let protoGuestOS: Omnia_Agent_V1_GuestOS = (guest == .linux) ? .linux : .windows
     return try await ShellSession.run(socketPath: socketPath, command: command, guestOS: protoGuestOS)
 }

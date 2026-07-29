@@ -51,7 +51,19 @@ the host `x86_64-unknown-linux-gnu` target installed. Add the target and
 confirm `cargo build --release --target aarch64-unknown-linux-musl` works
 before wiring it into `tools/build-linux-image/build.sh`.
 
-## `vmd/` — Swift, UNVERIFIED
+## `vmd/` — Swift, verified (build + tests on macOS 26 / Xcode 26.2)
+
+`swift build` and `swift test` both pass (7/7
+`GuestLifecycleControllerTests`). Fixes the first real compile needed:
+the snapshot APIs' real Swift names are `saveMachineStateTo(url:)` /
+`restoreMachineStateFrom(url:)`; `VZVirtualMachine` calls and the mutable
+VM reference are now confined to the runtime's serial queue (the VM is
+created with the queue-binding initializer); and `suspend()` pauses
+before saving state, which the framework requires. Still unproven at
+runtime: nothing here has booted a real guest yet — that's the M1
+acceptance flow's job. Original pre-compile status notes below.
+
+### Pre-compile notes (historical)
 
 Depends on `Virtualization.framework` and XPC (`NSXPCConnection`,
 `NSXPCListener`), both macOS-only and unavailable to compile-check here.
@@ -78,7 +90,25 @@ Depends on `Virtualization.framework` and XPC (`NSXPCConnection`,
   XPC service wiring. Ordinary `NSXPCConnection`/`NSXPCListener` usage,
   lower risk than the two files above, but still unbuilt.
 
-## `cli/` — Swift, UNVERIFIED, one file needs real reconciliation
+## `cli/` — Swift, verified (build on macOS 26 / Xcode 26.2), migrated to gRPC Swift 2
+
+`scripts/generate-swift-proto.sh` + `swift build` pass; `omnia --help`
+runs. The predicted rework of `ShellSession.swift` was real, and bigger
+than typo fixes: the draft targeted grpc-swift **1.x**, whose protoc
+plugin no longer ships as a brew bottle and which is maintenance-only.
+The cli package now uses **gRPC Swift 2** (GRPCCore +
+grpc-swift-nio-transport + grpc-swift-protobuf; plugin binary
+`protoc-gen-grpc-swift-2`), and `ShellSession.swift` was rewritten
+against the real generated v2 API (`withGRPCClient`,
+`Omnia_Agent_V1_OmniaAgent.Client`, writer-producer streaming). Cost:
+gRPC Swift 2 requires **macOS 15+**, so cli/Package.swift's platform
+floor is 15 (vmd remains 14; every Apple Silicon Mac can run 15).
+Also fixed: `@main` cannot live in `main.swift` (now `Omnia.swift`),
+and the generated enum is `Omnia_Agent_V1_GuestOS`, not `...GuestOs`.
+Unproven at runtime: an actual OpenShell round trip against the agent —
+that's the M1 acceptance flow. Original pre-compile status notes below.
+
+### Pre-compile notes (historical)
 
 - `Sources/omnia/main.swift`, `VMDClient.swift` — ArgumentParser commands and
   the XPC client talking to vmd. Ordinary Foundation code, lowest risk in

@@ -32,7 +32,10 @@ jobs:
 
   vmd:
     name: vmd (Swift, macOS)
-    runs-on: macos-14
+    # macos-15: the cli package (grpc-swift 2) needs a Swift 6 / macOS 15
+    # toolchain, and the macos-14 image also lacked a protoc-gen-grpc-swift
+    # brew bottle — keep both Swift jobs on the same image.
+    runs-on: macos-15
     defaults:
       run:
         working-directory: vmd
@@ -47,7 +50,7 @@ jobs:
 
   cli:
     name: cli (Swift, macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - name: Swift version
