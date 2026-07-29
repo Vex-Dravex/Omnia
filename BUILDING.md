@@ -45,11 +45,13 @@ above was tested via the `--unix-socket` dev-mode flag instead. **The first
 thing to verify on real guest hardware/VM is that the vsock path behaves the
 same way the UDS path was proven to.**
 
-Not yet cross-compiled: the production target is
-`aarch64-unknown-linux-musl` (for the guest image); this sandbox only has
-the host `x86_64-unknown-linux-gnu` target installed. Add the target and
-confirm `cargo build --release --target aarch64-unknown-linux-musl` works
-before wiring it into `tools/build-linux-image/build.sh`.
+Cross-compilation to the production target `aarch64-unknown-linux-musl`
+is verified from macOS: `rustup target add aarch64-unknown-linux-musl`,
+then `cargo build --release --target aarch64-unknown-linux-musl`
+produces a statically linked aarch64 ELF (~6 MB). No external musl-cross
+toolchain is needed — `guest-agent/.cargo/config.toml` sets `rust-lld`
+(shipped with rustup) as the linker for that target, using rust-std's
+self-contained musl CRT/libc objects.
 
 ## `vmd/` — Swift, verified (build + tests on macOS 26 / Xcode 26.2)
 
