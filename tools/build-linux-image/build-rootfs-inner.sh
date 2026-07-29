@@ -46,6 +46,17 @@ ln -sf /etc/systemd/system/omnia-agent.service \
 
 log "Guest configuration"
 echo "omnia-linux" > "$ROOTFS/etc/hostname"
+# DHCP on the NAT interface via systemd-networkd (in the base tarball —
+# no extra packages needed). Without this the guest has no networking.
+mkdir -p "$ROOTFS/etc/systemd/network"
+printf '[Match]\nName=en*\n\n[Network]\nDHCP=yes\n' \
+  > "$ROOTFS/etc/systemd/network/20-wired.network"
+for svc in systemd-networkd systemd-resolved; do
+  mkdir -p "$ROOTFS/etc/systemd/system/multi-user.target.wants"
+  ln -sf "/usr/lib/systemd/system/$svc.service" \
+    "$ROOTFS/etc/systemd/system/multi-user.target.wants/$svc.service"
+done
+ln -sf /run/systemd/resolve/stub-resolv.conf "$ROOTFS/etc/resolv.conf"
 # The guest side of AF_VSOCK needs the virtio transport loaded before the
 # agent can bind its vsock port.
 echo "vmw_vsock_virtio_transport" > "$ROOTFS/etc/modules-load.d/omnia-vsock.conf"
