@@ -41,6 +41,11 @@ impl BlockDeviceOps for RealBlockDeviceOps {
         Ok(fs_type)
     }
 
+    // The nix::mount API is Linux-shaped here (5-arg mount(2), umount);
+    // macOS's differs. The agent only ever performs real mounts inside the
+    // Linux guest — on other hosts (dev-mode via --unix-socket) these RPCs
+    // report unsupported instead of compiling against the wrong syscall.
+    #[cfg(target_os = "linux")]
     fn mount(&self, device_path: &str, mount_point: &str, fs_type: &str) -> anyhow::Result<()> {
         std::fs::create_dir_all(mount_point)?;
         let source = std::ffi::CString::new(device_path)?;
@@ -61,10 +66,25 @@ impl BlockDeviceOps for RealBlockDeviceOps {
         .map_err(|errno| anyhow::anyhow!("mount({device_path} -> {mount_point}) failed: {errno}"))
     }
 
+    #[cfg(not(target_os = "linux"))]
+    fn mount(&self, device_path: &str, mount_point: &str, _fs_type: &str) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "mount({device_path} -> {mount_point}) unsupported: block-device mounts only run in the Linux guest"
+        )
+    }
+
+    #[cfg(target_os = "linux")]
     fn unmount(&self, mount_point: &str) -> anyhow::Result<()> {
         let target = std::ffi::CString::new(mount_point)?;
         nix::mount::umount(target.as_c_str())
             .map_err(|errno| anyhow::anyhow!("umount({mount_point}) failed: {errno}"))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn unmount(&self, mount_point: &str) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "umount({mount_point}) unsupported: block-device mounts only run in the Linux guest"
+        )
     }
 }
 

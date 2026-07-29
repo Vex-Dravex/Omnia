@@ -10,7 +10,7 @@ was available. This shapes everything below: **the Rust guest-agent is real,
 built, and tested. The Swift code (vmd, cli) is a careful first draft that
 has never been compiled.**
 
-## `guest-agent/` — Rust, verified
+## `guest-agent/` — Rust, verified (Linux x86_64 and macOS arm64)
 
 ```
 cd guest-agent
@@ -22,6 +22,13 @@ cargo test            # 10/10 passing, including a real client/server
 cargo clippy --all-targets -- -D warnings   # clean
 cargo fmt -- --check                         # clean
 ```
+
+Re-verified on macOS 15 / Apple Silicon (rustc 1.97.1): all of the above
+pass there too. One platform fix was needed: `src/mount.rs` used the
+Linux-shaped `nix::mount` API, which doesn't exist on macOS — the real
+mount/umount impls are now gated `#[cfg(target_os = "linux")]`, with
+non-Linux hosts (dev-mode) returning a clear "only in the Linux guest"
+error. No tests needed gating; all 10 pass unmodified on macOS.
 
 What's real: `Hello`, `OpenShell` (interactive + one-shot commands, real PTY,
 real exit codes), `MountBlockDevice`/`UnmountBlockDevice` (real `mount(2)`
