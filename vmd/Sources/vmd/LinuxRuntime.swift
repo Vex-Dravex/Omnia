@@ -158,9 +158,27 @@ final class LinuxRuntime: NSObject, GuestRuntime, @unchecked Sendable {
                     case .failure(let error):
                         continuation.resume(throwing: error)
                     case .success:
-                        vm.saveMachineStateTo(url: self.snapshotPath) { error in
+                        // Save to a temp file and swap it in: VZ refuses to
+                        // overwrite an existing save file ("File exists"),
+                        // which would make every suspend after the first
+                        // fail — and the swap keeps the previous good
+                        // snapshot if this save dies partway.
+                        let tmpPath = self.snapshotPath.appendingPathExtension("tmp")
+                        try? FileManager.default.removeItem(at: tmpPath)
+                        vm.saveMachineStateTo(url: tmpPath) { error in
                             if let error {
-                                continuation.resume(throwing: error)
+                                Self.resumeAfterFailedSuspend(vm, then: continuation, error: error)
+                                return
+                            }
+                            do {
+                                if FileManager.default.fileExists(atPath: self.snapshotPath.path) {
+                                    _ = try FileManager.default.replaceItemAt(
+                                        self.snapshotPath, withItemAt: tmpPath)
+                                } else {
+                                    try FileManager.default.moveItem(at: tmpPath, to: self.snapshotPath)
+                                }
+                            } catch {
+                                Self.resumeAfterFailedSuspend(vm, then: continuation, error: error)
                                 return
                             }
                             vm.stop { error in
@@ -304,6 +322,21 @@ final class LinuxRuntime: NSObject, GuestRuntime, @unchecked Sendable {
                     }
                 }
             }
+        }
+    }
+
+    /// A suspend that fails after pause must put the VM back into
+    /// `running` before rethrowing — the lifecycle controller's fallback
+    /// state for a failed suspend is `.running`, and leaving the VM
+    /// actually paused behind that state wedges every subsequent vsock
+    /// connect ("must be running, currently paused").
+    private static func resumeAfterFailedSuspend(
+        _ vm: VZVirtualMachine,
+        then continuation: CheckedContinuation<Void, Error>,
+        error: any Error
+    ) {
+        vm.resume { _ in
+            continuation.resume(throwing: error)
         }
     }
 

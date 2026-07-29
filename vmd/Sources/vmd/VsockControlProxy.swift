@@ -134,7 +134,9 @@ final class VsockControlProxy {
                 Self.relay(clientFD, vsockFD) { [weak self] in
                     self?.sessionClosed()
                 }
-            case .failure:
+            case .failure(let error):
+                FileHandle.standardError.write(
+                    Data("vsock proxy: guest connect (port \(self.port)) failed: \(error)\n".utf8))
                 close(clientFD)
             }
         }

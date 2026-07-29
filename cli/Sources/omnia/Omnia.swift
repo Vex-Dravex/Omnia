@@ -7,7 +7,7 @@ struct Omnia: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "omnia",
         abstract: "Control and use your Omnia Linux/Windows guests.",
-        subcommands: [Status.self, Shell.self, Linux.self],
+        subcommands: [Status.self, Shell.self, Linux.self, Suspend.self],
         // Win.self joins this list in M3 once a Windows guest exists —
         // milestones/M3-windows-runtime.md's task list explicitly calls out
         // wiring Windows into this same CLI surface.
@@ -67,6 +67,22 @@ struct Shell: AsyncParsableCommand {
             throw ValidationError("Invalid selection.")
         }
         return choices[index - 1]
+    }
+}
+
+struct Suspend: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Suspend a guest immediately, bypassing the idle timer (docs/08-cli.md)."
+    )
+
+    @Argument(help: "Guest to suspend (default: linux).")
+    var guest: String = "linux"
+
+    func run() async throws {
+        guard let kind = GuestKind(rawValue: guest) else {
+            throw ValidationError("unknown guest: \(guest)")
+        }
+        try await VMDClient().forceSuspend(guest: kind)
     }
 }
 

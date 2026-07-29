@@ -46,7 +46,13 @@ Hard-won fixes the drafts needed, so nobody re-learns them:
   `VZGenericMachineIdentifier` AND the network device's MAC address. Both
   are persisted next to the image (`machine-id`, `mac-address`) on first
   boot.
-- `saveMachineStateTo` requires the VM to be paused first.
+- `saveMachineStateTo` requires the VM to be paused first, and refuses
+  to overwrite an existing save file — suspend saves to a `.tmp` and
+  swaps it in (verified across 4 consecutive suspend/resume cycles). If
+  anything in the save path fails after the pause, the VM is resumed
+  before rethrowing: the controller's failed-suspend fallback state is
+  `.running`, and a VM left actually-paused behind that state wedges
+  every subsequent vsock connect.
 - `VZVirtualMachine` is queue-bound: every VM/device call happens on the
   serial queue the VM was created with (see LinuxRuntime).
 - A bare `VZVirtioConsoleDeviceConfiguration` fails validation; the

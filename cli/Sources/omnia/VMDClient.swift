@@ -67,6 +67,19 @@ final class VMDClient {
         }
     }
 
+    func forceSuspend(guest: GuestKind) async throws {
+        let proxy = try proxy
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            proxy.forceSuspend(guest: guest.rawValue) { success, error in
+                if success {
+                    continuation.resume()
+                } else {
+                    continuation.resume(throwing: VMDClientError(description: error ?? "unknown error"))
+                }
+            }
+        }
+    }
+
     func status() async throws -> [GuestKind: String] {
         let proxy = try proxy
         let raw: [String: String] = await withCheckedContinuation { continuation in
