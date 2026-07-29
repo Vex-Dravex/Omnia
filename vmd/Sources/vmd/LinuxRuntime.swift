@@ -12,11 +12,16 @@ import OmniaVMDCore
 /// exact `VZLinuxBootLoader` vs `VZEFIBootLoader` choice against the actual
 /// image produced by tools/build-linux-image (M1's task #3 notes this same
 /// open decision).
-final class LinuxRuntime: GuestRuntime {
+final class LinuxRuntime: GuestRuntime, @unchecked Sendable {
     private let imagePath: URL
     private let snapshotPath: URL
     private let auxiliaryStoragePath: URL
 
+    /// `VZVirtualMachine` is queue-bound: every call on it (and on its
+    /// devices) must happen on the serial queue it was created with. All
+    /// access to `virtualMachine` is confined to `queue` — VZ completion
+    /// handlers already arrive on it — which is what justifies the
+    /// @unchecked Sendable above despite the mutable stored property.
     private var virtualMachine: VZVirtualMachine?
     private let queue = DispatchQueue(label: "com.omnia.vmd.linuxruntime")
 
@@ -31,15 +36,34 @@ final class LinuxRuntime: GuestRuntime {
     /// connect to (see VMDService.controlSocketPath). nil whenever the
     /// guest isn't `.running`.
     func currentVsockDevice() -> VZVirtioSocketDevice? {
-        virtualMachine?.socketDevices.first as? VZVirtioSocketDevice
+        queue.sync {
+            virtualMachine?.socketDevices.first as? VZVirtioSocketDevice
+        }
     }
 
     // MARK: - GuestRuntime
 
     func coldBoot() async throws {
-        let vm = try makeVirtualMachine()
-        try await start(vm)
-        virtualMachine = vm
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            queue.async {
+                let vm: VZVirtualMachine
+                do {
+                    vm = try self.makeVirtualMachine()
+                } catch {
+                    continuation.resume(throwing: error)
+                    return
+                }
+                vm.start { result in
+                    switch result {
+                    case .success:
+                        self.virtualMachine = vm
+                        continuation.resume()
+                    case .failure(let error):
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+        }
     }
 
     func resume() async throws {
@@ -50,46 +74,66 @@ final class LinuxRuntime: GuestRuntime {
             // in the caller).
             throw LinuxRuntimeError.missingSnapshot
         }
-        let vm = try makeVirtualMachine()
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            vm.restoreMachineState(from: snapshotPath) { error in
-                if let error {
+            queue.async {
+                let vm: VZVirtualMachine
+                do {
+                    vm = try self.makeVirtualMachine()
+                } catch {
                     continuation.resume(throwing: error)
                     return
                 }
-                vm.resume { result in
-                    switch result {
-                    case .success:
-                        continuation.resume()
-                    case .failure(let error):
+                vm.restoreMachineStateFrom(url: self.snapshotPath) { error in
+                    if let error {
                         continuation.resume(throwing: error)
+                        return
+                    }
+                    vm.resume { result in
+                        switch result {
+                        case .success:
+                            self.virtualMachine = vm
+                            continuation.resume()
+                        case .failure(let error):
+                            continuation.resume(throwing: error)
+                        }
                     }
                 }
             }
         }
-        virtualMachine = vm
     }
 
     func suspend() async throws {
-        guard let vm = virtualMachine else {
-            throw LinuxRuntimeError.notRunning
-        }
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            vm.saveMachineState(to: snapshotPath) { error in
-                if let error {
-                    continuation.resume(throwing: error)
+            queue.async {
+                guard let vm = self.virtualMachine else {
+                    continuation.resume(throwing: LinuxRuntimeError.notRunning)
                     return
                 }
-                vm.stop { error in
-                    if let error {
+                // saveMachineStateTo requires the VM to be paused first —
+                // saving a running VM is rejected by the framework.
+                vm.pause { result in
+                    switch result {
+                    case .failure(let error):
                         continuation.resume(throwing: error)
-                    } else {
-                        continuation.resume()
+                    case .success:
+                        vm.saveMachineStateTo(url: self.snapshotPath) { error in
+                            if let error {
+                                continuation.resume(throwing: error)
+                                return
+                            }
+                            vm.stop { error in
+                                if let error {
+                                    continuation.resume(throwing: error)
+                                } else {
+                                    self.virtualMachine = nil
+                                    continuation.resume()
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
-        virtualMachine = nil
     }
 
     // MARK: - Configuration (docs/02-linux-runtime.md's table)
@@ -139,20 +183,9 @@ final class LinuxRuntime: GuestRuntime {
         // VZVirtualMachineView explicitly.
 
         try config.validate()
-        return VZVirtualMachine(configuration: config)
-    }
-
-    private func start(_ vm: VZVirtualMachine) async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            vm.start { result in
-                switch result {
-                case .success:
-                    continuation.resume()
-                case .failure(let error):
-                    continuation.resume(throwing: error)
-                }
-            }
-        }
+        // Bind the VM to our serial queue — the queue-less initializer
+        // binds to the main queue, which is not where we drive it from.
+        return VZVirtualMachine(configuration: config, queue: queue)
     }
 }
 
